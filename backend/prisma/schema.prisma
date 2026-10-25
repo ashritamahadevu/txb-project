@@ -1,0 +1,157 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String            @id @default(cuid())
+  walletPubkey String            @unique
+  displayName  String?
+  ageConfirmed Boolean           @default(false)
+  practice     Boolean           @default(false)
+  createdAt    DateTime          @default(now())
+  sessions     Session[]
+  memberships  CircleMember[]
+  participants BetParticipant[]
+  proofs       ProofPost[]
+  comments     Comment[]
+  reactions    Reaction[]
+  judging      JudgeAssignment[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model Nonce {
+  id        String   @id @default(cuid())
+  value     String   @unique
+  expiresAt DateTime
+}
+
+model Circle {
+  id           String         @id @default(cuid())
+  name         String
+  inviteCode   String         @unique
+  defaultStake Int            @default(1000000)
+  createdAt    DateTime       @default(now())
+  members      CircleMember[]
+  bets         Bet[]
+}
+
+model CircleMember {
+  id       String   @id @default(cuid())
+  circleId String
+  userId   String
+  roles    String[]
+  circle   Circle   @relation(fields: [circleId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([circleId, userId])
+}
+
+model GoalTemplate {
+  id             String @id @default(cuid())
+  category       String
+  title          String
+  description    String
+  verification   String
+  proofsRequired Int
+}
+
+model Bet {
+  id             String            @id @default(cuid())
+  circleId       String
+  creatorId      String
+  betType        String
+  title          String
+  category       String
+  stakeAmount    Int
+  goalHash       String
+  onChainBetId   String?
+  onChainAddress String?
+  status         String
+  requiredCount  Int
+  proofsRequired Int
+  periodStart    DateTime
+  periodEnd      DateTime
+  evidenceHash   String?
+  circle         Circle            @relation(fields: [circleId], references: [id], onDelete: Cascade)
+  participants   BetParticipant[]
+  judges         JudgeAssignment[]
+  proofs         ProofPost[]
+  createdAt      DateTime          @default(now())
+}
+
+model BetParticipant {
+  id       String   @id @default(cuid())
+  betId    String
+  userId   String
+  outcome  String   @default("pending")
+  joinedAt DateTime @default(now())
+  bet      Bet      @relation(fields: [betId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([betId, userId])
+}
+
+model JudgeAssignment {
+  id     String  @id @default(cuid())
+  betId  String
+  userId String
+  vote   String?
+  bet    Bet     @relation(fields: [betId], references: [id], onDelete: Cascade)
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([betId, userId])
+}
+
+model ProofPost {
+  id         String     @id @default(cuid())
+  betId      String
+  userId     String
+  caption    String?
+  photoPath  String
+  photoHash  String
+  dHash      String
+  capturedAt DateTime
+  flagged    Boolean    @default(false)
+  flagReason String?
+  reported   Boolean    @default(false)
+  bet        Bet        @relation(fields: [betId], references: [id], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  comments   Comment[]
+  reactions  Reaction[]
+  createdAt  DateTime   @default(now())
+}
+
+model Comment {
+  id        String    @id @default(cuid())
+  proofId   String
+  userId    String
+  body      String
+  proof     ProofPost @relation(fields: [proofId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime  @default(now())
+}
+
+model Reaction {
+  id        String    @id @default(cuid())
+  proofId   String
+  userId    String
+  kind      String
+  proof     ProofPost @relation(fields: [proofId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime  @default(now())
+
+  @@unique([proofId, userId, kind])
+}
