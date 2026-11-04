@@ -48,6 +48,7 @@ export default function Circles() {
     <Screen>
       <Title>Circles</Title>
       <Muted>A circle is the group that can see the proofs and argue about the result.</Muted>
+      <Button label="Wallet" tone="ghost" onPress={() => router.push("/wallet")} />
       {circles.map((circle) => (
         <Pressable key={circle.id} onPress={() => router.push(`/circle/${circle.id}`)}>
           <Card>

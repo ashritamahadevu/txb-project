@@ -18,9 +18,12 @@ model User {
   memberships  CircleMember[]
   participants BetParticipant[]
   proofs       ProofPost[]
-  comments     Comment[]
-  reactions    Reaction[]
-  judging      JudgeAssignment[]
+  comments       Comment[]
+  reactions      Reaction[]
+  judging        JudgeAssignment[]
+  ballots        DisputeBallot[] @relation("BallotVoter")
+  castBallots    DisputeBallot[] @relation("BallotCaster")
+  disputesOpened Bet[]           @relation("Disputer")
 }
 
 model Session {
@@ -69,37 +72,44 @@ model GoalTemplate {
 }
 
 model Bet {
-  id             String            @id @default(cuid())
-  circleId       String
-  creatorId      String
-  betType        String
-  title          String
-  category       String
-  stakeAmount    Int
-  goalHash       String
-  onChainBetId   String?
-  onChainAddress String?
-  status         String
-  requiredCount  Int
-  proofsRequired Int
-  periodStart    DateTime
-  periodEnd      DateTime
-  evidenceHash   String?
-  circle         Circle            @relation(fields: [circleId], references: [id], onDelete: Cascade)
-  participants   BetParticipant[]
-  judges         JudgeAssignment[]
-  proofs         ProofPost[]
-  createdAt      DateTime          @default(now())
+  id                   String            @id @default(cuid())
+  circleId             String
+  creatorId            String
+  betType              String
+  title                String
+  category             String
+  stakeAmount          Int
+  goalHash             String
+  onChainBetId         String?
+  onChainAddress       String?
+  status               String
+  requiredCount        Int
+  proofsRequired       Int
+  periodStart          DateTime
+  periodEnd            DateTime
+  evidenceHash         String?
+  disputeWindowSeconds Int               @default(86400)
+  disputeDeadline      DateTime?
+  disputerId           String?
+  disputer             User?             @relation("Disputer", fields: [disputerId], references: [id], onDelete: SetNull)
+  disputeResolution    String?
+  circle               Circle            @relation(fields: [circleId], references: [id], onDelete: Cascade)
+  participants         BetParticipant[]
+  judges               JudgeAssignment[]
+  proofs               ProofPost[]
+  ballots              DisputeBallot[]
+  createdAt            DateTime          @default(now())
 }
 
 model BetParticipant {
-  id       String   @id @default(cuid())
-  betId    String
-  userId   String
-  outcome  String   @default("pending")
-  joinedAt DateTime @default(now())
-  bet      Bet      @relation(fields: [betId], references: [id], onDelete: Cascade)
-  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id              String   @id @default(cuid())
+  betId           String
+  userId          String
+  outcome         String   @default("pending")
+  reporterOutcome String?
+  joinedAt        DateTime @default(now())
+  bet             Bet      @relation(fields: [betId], references: [id], onDelete: Cascade)
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([betId, userId])
 }
@@ -154,4 +164,19 @@ model Reaction {
   createdAt DateTime  @default(now())
 
   @@unique([proofId, userId, kind])
+}
+
+model DisputeBallot {
+  id        String   @id @default(cuid())
+  betId     String
+  voterId   String
+  outcomes  Json
+  demo      Boolean  @default(false)
+  castById  String?
+  createdAt DateTime @default(now())
+  bet       Bet      @relation(fields: [betId], references: [id], onDelete: Cascade)
+  voter     User     @relation("BallotVoter", fields: [voterId], references: [id], onDelete: Cascade)
+  castBy    User?    @relation("BallotCaster", fields: [castById], references: [id], onDelete: SetNull)
+
+  @@unique([betId, voterId])
 }

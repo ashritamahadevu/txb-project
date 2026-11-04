@@ -58,7 +58,9 @@ npx prisma db push
 npm start
 ```
 
-The API listens on port 4000. The demo reporter key is `dev-reporter` (`x-reporter-key`). `POST /v1/bets/:id/resolve` with `{ "early": true }` closes a period before `periodEnd`, and only that key is accepted. Sign-in is a Sign-In With Solana style message, verified with tweetnacl.
+The API listens on port 4000. The demo reporter key is `dev-reporter` (`x-reporter-key`). `POST /v1/bets/:id/resolve` with `{ "early": true }` closes a period before `periodEnd`, and only that key is accepted. The same key on `POST /v1/bets/:id/dispute/close` ends the dispute window early. Sign-in is a Sign-In With Solana style message, verified with tweetnacl.
+
+A bet takes `periodMinutes` (5 minutes through 90 days) or `periodHours`, and an optional `disputeWindowMinutes` (5 minutes through 7 days, default 1 day). Head to head is two people. A pool is two to ten, chosen with `participantIds`. Judges, when set, are one or three circle members who are not in the bet. `POST /v1/circles/:id/practice-partner` adds another practice partner, up to nine. After the reporter resolves a bet, a member can `POST /v1/bets/:id/dispute`, then `POST /v1/bets/:id/votes` with one success or fail per participant. A strict majority overturns or upholds the reporter. The circle owner can send `asUserId` to cast that ballot for a practice partner; the ballot is stored as a demo vote. `PATCH /v1/me` sets the display name. `POST /v1/me/wallet` changes the public key and returns a new session.
 
 ```bash
 cd backend
@@ -73,6 +75,20 @@ npm install
 npx expo start
 ```
 
-`EXPO_PUBLIC_API_URL` defaults to `http://localhost:4000`. Phantom, Solflare, and Backpack are the wallets for a device build (Wallet Adapter on web, Mobile Wallet Adapter on Android). The browser preview keeps an ed25519 key on the device so the loop can be signed without a wallet extension.
+`EXPO_PUBLIC_API_URL` defaults to `http://localhost:4000`. Phantom, Solflare, and Backpack are the wallets for a device build (Wallet Adapter on web, Mobile Wallet Adapter on Android). The browser preview keeps an ed25519 key on the device so the loop can be signed without a wallet extension. The Wallet screen shows that key and the display name, and can paste a different public key or generate a new device key.
 
-In a circle you own, "Add a practice partner" creates a second member so a head-to-head habit bet can be opened from one device.
+In a circle you own, "Add a practice partner" adds a member with no device of their own, up to nine, so a bet can be opened from one browser. The names run "Practice partner", then "Practice partner 2".
+
+## Demo walkthrough
+
+Use one browser. Start the API, then from `mobile` run `npx expo start` and open the web preview.
+
+1. Confirm you are 18 or older and continue. Create a circle.
+2. Add a practice partner twice. The circle lists "Practice partner" and "Practice partner 2".
+3. Open a habit bet. Select yourself and Practice partner. Leave Practice partner 2 unchecked so they can vote. Pick a period: 5 minutes, 1 day, 3 days, 1 week, 2 weeks, or a custom number of days. Leave judges unset. With three or more people selected, the bet is a pool (up to ten).
+4. Open the bet, add a photo, then press "Close the period (devnet demo)". You succeeded. The practice partner who posted nothing failed. That is the reporter's result, and the dispute window is open.
+5. Press "Open a dispute". For each person, choose success or fail, then press "Demo: vote as Practice partner 2". The ballot is labeled as a demo vote you cast for that practice partner.
+6. One eligible voter is a strict majority, so the bet screen shows the final result immediately. Matching the reporter upholds it. Any difference overturns it, and the list shows the new outcome next to what the reporter said.
+7. Press "Close dispute window (demo)" instead of opening a dispute and the reporter's result stands. To show a refund, assign three judges, cast only one of their votes, and close the window so no strict majority forms. A 5-minute dispute window is the short option if you would rather wait it out.
+
+Wallet, in the header and on Circles, is the public key and display name. Saving a name updates the circle. Generating a device key signs this account in as that key. Pasting a public key switches the address and refreshes the session. Phone builds use Phantom, Solflare, or Backpack. This preview does not connect an extension.

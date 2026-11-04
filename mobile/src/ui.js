@@ -34,6 +34,14 @@ export function Field({ value, onChangeText, placeholder, ...rest }) {
   );
 }
 
+export function Choice({ label, selected, onPress }) {
+  return (
+    <Pressable onPress={onPress} style={[styles.choice, selected && styles.choiceOn]}>
+      <Text style={[styles.choiceText, selected && styles.choiceTextOn]}>{label}</Text>
+    </Pressable>
+  );
+}
+
 export function Button({ label, onPress, tone = "lime", disabled }) {
   return (
     <Pressable
@@ -85,5 +93,15 @@ const styles = StyleSheet.create({
   disabled: { opacity: 0.5 },
   buttonText: { color: colors.ink, fontFamily: sans, fontWeight: "700", fontSize: 15 },
   ghostText: { color: colors.text },
+  choice: {
+    borderWidth: 1,
+    borderColor: colors.line,
+    borderRadius: 999,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+  },
+  choiceOn: { backgroundColor: colors.lime, borderColor: colors.lime },
+  choiceText: { color: colors.text, fontFamily: sans, fontSize: 14 },
+  choiceTextOn: { color: colors.ink, fontWeight: "700" },
   error: { color: colors.coral, fontFamily: sans },
 });
