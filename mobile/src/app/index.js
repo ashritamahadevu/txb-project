@@ -4,6 +4,7 @@ import { router } from "expo-router";
 import { api } from "../api";
 import { colors, sans } from "../theme";
 import { Button, ErrorText, Muted, Screen, Title } from "../ui";
+import { getToken } from "../session";
 import { signInWithDeviceKey } from "../wallet";
 
 export default function SignIn() {
@@ -19,7 +20,15 @@ export default function SignIn() {
     setBusy(true);
     setError("");
     try {
-      const user = await signInWithDeviceKey();
+      let user = null;
+      if (await getToken()) {
+        try {
+          user = (await api("/v1/me")).user;
+        } catch {
+          user = null;
+        }
+      }
+      if (!user) user = await signInWithDeviceKey();
       if (!user.ageConfirmed) {
         await api("/v1/me/age", { method: "POST", json: { confirmed: true } });
       }

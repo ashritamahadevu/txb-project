@@ -14,6 +14,14 @@ export function signInMessage(wallet: string, nonce: string): string {
   return `TxB wants you to sign in\nWallet: ${wallet}\nNonce: ${nonce}`;
 }
 
+export function isPublicKey(wallet: string): boolean {
+  try {
+    return bs58.decode(wallet).length === nacl.sign.publicKeyLength;
+  } catch {
+    return false;
+  }
+}
+
 export function verifyWalletSignature(wallet: string, message: string, signature: string): boolean {
   try {
     const key = bs58.decode(wallet);

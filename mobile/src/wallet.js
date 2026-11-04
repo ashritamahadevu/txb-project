@@ -26,3 +26,32 @@ export async function signInWithDeviceKey() {
   await setToken(result.token);
   return result.user;
 }
+
+export async function saveDisplayName(displayName) {
+  const result = await api("/v1/me", { method: "PATCH", json: { displayName } });
+  return result.user;
+}
+
+export async function usePublicKey(walletPubkey) {
+  const result = await api("/v1/me/wallet", {
+    method: "POST",
+    json: { walletPubkey: walletPubkey.trim() },
+  });
+  await setToken(result.token);
+  return result.user;
+}
+
+export async function generateDeviceKey() {
+  const pair = nacl.sign.keyPair();
+  const publicKey = bs58.encode(pair.publicKey);
+  const { nonce } = await api("/v1/auth/nonce", { method: "POST" });
+  const message = `TxB wants you to sign in\nWallet: ${publicKey}\nNonce: ${nonce}`;
+  const signature = bs58.encode(nacl.sign.detached(new TextEncoder().encode(message), pair.secretKey));
+  const result = await api("/v1/me/wallet", {
+    method: "POST",
+    json: { walletPubkey: publicKey, signature, nonce },
+  });
+  await setSecret(bs58.encode(pair.secretKey));
+  await setToken(result.token);
+  return result.user;
+}

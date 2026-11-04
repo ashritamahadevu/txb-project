@@ -2,13 +2,23 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Prisma } from "@prisma/client";
 import express, { type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { newNonce, newToken, signInMessage, verifyWalletSignature } from "./auth.js";
+import { isPublicKey, newNonce, newToken, signInMessage, verifyWalletSignature } from "./auth.js";
 import { prisma, seedTemplates } from "./db.js";
+import { settleBet } from "./dispute.js";
 import { hammingHex, looksReused, preparePhoto } from "./photo.js";
 import { decideOutcomes, evidenceDigest } from "./resolve.js";
+import {
+  MAX_POOL,
+  MAX_PRACTICE_PARTNERS,
+  betLengthMinutes,
+  disputeWindowSeconds,
+  eligibleVoterIds,
+  parseBallot,
+} from "./rules.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -16,6 +26,24 @@ const upload = multer({
 });
 
 const uploadsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "uploads");
+
+const betInclude = {
+  circle: { include: { members: { include: { user: true } } } },
+  participants: { include: { user: true }, orderBy: { joinedAt: "asc" as const } },
+  judges: { include: { user: true } },
+  proofs: {
+    include: {
+      user: true,
+      comments: { include: { user: true }, orderBy: { createdAt: "asc" as const } },
+      reactions: true,
+    },
+    orderBy: { createdAt: "asc" as const },
+  },
+  ballots: { include: { voter: true, castBy: true }, orderBy: { createdAt: "asc" as const } },
+  disputer: true,
+} satisfies Prisma.BetInclude;
+
+type FullBet = Prisma.BetGetPayload<{ include: typeof betInclude }>;
 
 type Authed = Request & { userId?: string };
 
@@ -47,14 +75,42 @@ async function requireUser(req: Authed, res: Response, next: NextFunction) {
   next();
 }
 
-function publicUser(user: { id: string; walletPubkey: string; displayName: string | null; ageConfirmed: boolean; practice: boolean }) {
+type PublicSource = {
+  id: string;
+  walletPubkey: string;
+  displayName: string | null;
+  ageConfirmed: boolean;
+  practice: boolean;
+};
+
+function publicUser(user: PublicSource) {
+  const custom = user.displayName?.trim() ?? "";
   return {
     id: user.id,
     walletPubkey: user.walletPubkey,
-    displayName: user.displayName ?? `${user.walletPubkey.slice(0, 4)}…${user.walletPubkey.slice(-4)}`,
+    displayName: custom || `${user.walletPubkey.slice(0, 4)}…${user.walletPubkey.slice(-4)}`,
+    hasName: custom.length > 0,
     ageConfirmed: user.ageConfirmed,
     practice: user.practice,
   };
+}
+
+function isReporter(req: Request): boolean {
+  return req.header("x-reporter-key") === (process.env.REPORTER_API_KEY || "dev-reporter");
+}
+
+function isUnique(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "P2002");
+}
+
+async function issueSession(userId: string): Promise<string> {
+  const token = newToken();
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  await prisma.$transaction([
+    prisma.session.deleteMany({ where: { userId } }),
+    prisma.session.create({ data: { token, userId, expiresAt } }),
+  ]);
+  return token;
 }
 
 export function createApp() {
@@ -145,6 +201,82 @@ export function createApp() {
       data: { ageConfirmed: true },
     });
     res.json({ user: publicUser(user) });
+  });
+
+  app.patch("/v1/me", requireUser, async (req: Authed, res) => {
+    const body = z.object({ displayName: z.string().min(1).max(40) }).safeParse(req.body);
+    if (!body.success) {
+      res.status(400).json({ error: "Display name must be 1 to 40 characters" });
+      return;
+    }
+    const displayName = body.data.displayName.trim();
+    if (displayName.length < 1 || displayName.length > 40) {
+      res.status(400).json({ error: "Display name must be 1 to 40 characters" });
+      return;
+    }
+    const user = await prisma.user.update({
+      where: { id: req.userId },
+      data: { displayName },
+    });
+    res.json({ user: publicUser(user) });
+  });
+
+  app.post("/v1/me/wallet", requireUser, async (req: Authed, res) => {
+    const body = z
+      .object({
+        walletPubkey: z.string().min(32).max(100),
+        signature: z.string().min(64).max(200).optional(),
+        nonce: z.string().min(8).max(80).optional(),
+      })
+      .safeParse(req.body);
+    if (!body.success || !isPublicKey(body.data.walletPubkey)) {
+      res.status(400).json({ error: "That is not a Solana public key" });
+      return;
+    }
+    const walletPubkey = body.data.walletPubkey;
+    if (body.data.signature || body.data.nonce) {
+      if (!body.data.signature || !body.data.nonce) {
+        res.status(400).json({ error: "Wallet, signature, and nonce are required" });
+        return;
+      }
+      const nonce = await prisma.nonce.findUnique({ where: { value: body.data.nonce } });
+      if (!nonce || nonce.expiresAt.getTime() < Date.now()) {
+        res.status(401).json({ error: "Nonce expired" });
+        return;
+      }
+      const message = signInMessage(walletPubkey, body.data.nonce);
+      if (!verifyWalletSignature(walletPubkey, message, body.data.signature)) {
+        res.status(401).json({ error: "Signature did not match" });
+        return;
+      }
+      await prisma.nonce.delete({ where: { id: nonce.id } });
+      const taken = await prisma.user.findUnique({ where: { walletPubkey } });
+      if (taken && taken.id !== req.userId) {
+        const token = await issueSession(taken.id);
+        res.json({ token, user: publicUser(taken) });
+        return;
+      }
+    } else {
+      const taken = await prisma.user.findUnique({ where: { walletPubkey } });
+      if (taken && taken.id !== req.userId) {
+        res.status(409).json({ error: "That wallet already belongs to an account" });
+        return;
+      }
+    }
+    try {
+      const user = await prisma.user.update({
+        where: { id: req.userId },
+        data: { walletPubkey },
+      });
+      const token = await issueSession(user.id);
+      res.json({ token, user: publicUser(user) });
+    } catch (error) {
+      if (isUnique(error)) {
+        res.status(409).json({ error: "That wallet already belongs to an account" });
+        return;
+      }
+      throw error;
+    }
   });
 
   app.get("/v1/circles", requireUser, async (req: Authed, res) => {
@@ -264,24 +396,27 @@ export function createApp() {
       res.status(403).json({ error: "Only the circle owner can add a practice partner" });
       return;
     }
-    const existing = await prisma.circleMember.findFirst({
-      where: { circleId: req.params.id, user: { practice: true } },
-      include: { user: true },
+    const created = await prisma.$transaction(async (tx) => {
+      const count = await tx.circleMember.count({
+        where: { circleId: req.params.id, user: { practice: true } },
+      });
+      if (count >= MAX_PRACTICE_PARTNERS) return null;
+      const displayName = count === 0 ? "Practice partner" : `Practice partner ${count + 1}`;
+      return tx.user.create({
+        data: {
+          walletPubkey: `practice-${randomBytes(16).toString("hex")}`,
+          displayName,
+          ageConfirmed: true,
+          practice: true,
+          memberships: { create: { circleId: req.params.id, roles: ["member"] } },
+        },
+      });
     });
-    if (existing) {
-      res.json({ user: publicUser(existing.user) });
+    if (!created) {
+      res.status(409).json({ error: "A circle can have at most 9 practice partners" });
       return;
     }
-    const user = await prisma.user.create({
-      data: {
-        walletPubkey: `practice-${randomBytes(16).toString("hex")}`,
-        displayName: "Practice partner",
-        ageConfirmed: true,
-        practice: true,
-        memberships: { create: { circleId: req.params.id, roles: ["member"] } },
-      },
-    });
-    res.status(201).json({ user: publicUser(user) });
+    res.status(201).json({ user: publicUser(created) });
   });
 
   app.post("/v1/circles/:id/bets", requireUser, async (req: Authed, res) => {
@@ -303,13 +438,28 @@ export function createApp() {
         betType: z.enum(["head_to_head", "pool"]),
         stakeAmount: z.number().int().positive().max(1_000_000_000),
         proofsRequired: z.number().int().min(1).max(30),
-        periodHours: z.number().int().min(1).max(24 * 90),
-        participantIds: z.array(z.string()).min(1).max(10),
-        judgeIds: z.array(z.string()).max(3).optional(),
+        periodHours: z.number().int().optional(),
+        periodMinutes: z.number().int().optional(),
+        disputeWindowMinutes: z.number().int().optional(),
+        participantIds: z.array(z.string().min(1)).min(1).max(20),
+        judgeIds: z.array(z.string().min(1)).max(5).optional(),
       })
       .safeParse(req.body);
     if (!body.success) {
       res.status(400).json({ error: "Bet details are incomplete" });
+      return;
+    }
+    const length = betLengthMinutes({
+      periodHours: body.data.periodHours,
+      periodMinutes: body.data.periodMinutes,
+    });
+    if ("error" in length) {
+      res.status(400).json({ error: length.error });
+      return;
+    }
+    const window = disputeWindowSeconds(body.data.disputeWindowMinutes);
+    if ("error" in window) {
+      res.status(400).json({ error: window.error });
       return;
     }
     const participantIds = [...new Set(body.data.participantIds)];
@@ -326,13 +476,21 @@ export function createApp() {
       res.status(400).json({ error: "A bet needs at least two people" });
       return;
     }
+    if (participantIds.length > MAX_POOL) {
+      res.status(400).json({ error: "A pool can include at most 10 people" });
+      return;
+    }
     const members = await prisma.circleMember.findMany({ where: { circleId: req.params.id } });
     const memberIds = new Set(members.map((member) => member.userId));
     if (participantIds.some((id) => !memberIds.has(id))) {
       res.status(400).json({ error: "Every participant must be in the circle" });
       return;
     }
-    const judgeIds = body.data.judgeIds ?? [];
+    const judgeIds = [...new Set(body.data.judgeIds ?? [])];
+    if (judgeIds.length !== 0 && judgeIds.length !== 1 && judgeIds.length !== 3) {
+      res.status(400).json({ error: "Assign one or three judges, or leave judges unset" });
+      return;
+    }
     if (judgeIds.some((id) => participantIds.includes(id) || !memberIds.has(id))) {
       res.status(400).json({ error: "Judges must be circle members who are not in the bet" });
       return;
@@ -351,7 +509,8 @@ export function createApp() {
         requiredCount: required,
         proofsRequired: body.data.proofsRequired,
         periodStart: now,
-        periodEnd: new Date(now.getTime() + body.data.periodHours * 60 * 60 * 1000),
+        periodEnd: new Date(now.getTime() + length.minutes * 60 * 1000),
+        disputeWindowSeconds: window.seconds,
         participants: {
           create: participantIds.map((userId) => ({ userId })),
         },
@@ -359,18 +518,19 @@ export function createApp() {
           create: judgeIds.map((userId) => ({ userId })),
         },
       },
-      include: { participants: { include: { user: true }, orderBy: { joinedAt: "asc" } } },
+      include: betInclude,
     });
-    res.status(201).json({ bet: serializeBet(bet) });
+    res.status(201).json({ bet: serializeBet(bet, user.id) });
   });
 
   app.get("/v1/bets/:id", requireUser, async (req: Authed, res) => {
+    await settleBet(req.params.id);
     const bet = await loadVisibleBet(req.params.id, req.userId!);
     if (!bet) {
       res.status(404).json({ error: "Bet not found" });
       return;
     }
-    res.json({ bet: serializeBet(bet) });
+    res.json({ bet: serializeBet(bet, req.userId) });
   });
 
   app.post("/v1/bets/:id/proofs", requireUser, upload.single("photo"), async (req: Authed, res) => {
@@ -499,8 +659,175 @@ export function createApp() {
     res.json({ reported: true });
   });
 
+  app.post("/v1/bets/:id/dispute", requireUser, async (req: Authed, res) => {
+    await settleBet(req.params.id);
+    const bet = await prisma.bet.findUnique({
+      where: { id: req.params.id },
+      include: { circle: { include: { members: true } } },
+    });
+    if (!bet || !bet.circle.members.some((member) => member.userId === req.userId)) {
+      res.status(404).json({ error: "Bet not found" });
+      return;
+    }
+    if (bet.status === "disputed") {
+      res.status(409).json({ error: "This bet is already disputed" });
+      return;
+    }
+    if (bet.status !== "resolved") {
+      res.status(409).json({
+        error: bet.status === "final" ? "The dispute window is closed" : "Resolve the bet before opening a dispute",
+      });
+      return;
+    }
+    if (bet.disputeDeadline && bet.disputeDeadline.getTime() <= Date.now()) {
+      res.status(409).json({ error: "The dispute window is closed" });
+      return;
+    }
+    const updated = await prisma.bet.updateMany({
+      where: {
+        id: bet.id,
+        status: "resolved",
+        OR: [{ disputeDeadline: null }, { disputeDeadline: { gt: new Date() } }],
+      },
+      data: { status: "disputed", disputerId: req.userId },
+    });
+    if (updated.count === 0) {
+      res.status(409).json({ error: "The dispute window is closed" });
+      return;
+    }
+    const fresh = await loadVisibleBet(bet.id, req.userId!);
+    res.status(201).json({ bet: serializeBet(fresh!, req.userId) });
+  });
+
+  app.post("/v1/bets/:id/votes", requireUser, async (req: Authed, res) => {
+    await settleBet(req.params.id);
+    const body = z
+      .object({
+        outcomes: z
+          .array(z.object({ userId: z.string().min(1), outcome: z.enum(["success", "fail"]) }))
+          .min(1)
+          .max(MAX_POOL),
+        asUserId: z.string().min(1).optional(),
+      })
+      .safeParse(req.body);
+    if (!body.success) {
+      res.status(400).json({ error: "Vote success or fail for every participant" });
+      return;
+    }
+    const bet = await prisma.bet.findUnique({
+      where: { id: req.params.id },
+      include: {
+        participants: { orderBy: { joinedAt: "asc" } },
+        judges: true,
+        circle: { include: { members: { include: { user: true } } } },
+      },
+    });
+    if (!bet || !bet.circle.members.some((member) => member.userId === req.userId)) {
+      res.status(404).json({ error: "Bet not found" });
+      return;
+    }
+    if (bet.status !== "disputed") {
+      res.status(409).json({
+        error: bet.status === "final" ? "The result is already final" : "Open a dispute before voting",
+      });
+      return;
+    }
+    if (bet.disputeDeadline && bet.disputeDeadline.getTime() <= Date.now()) {
+      res.status(409).json({ error: "The dispute window is closed" });
+      return;
+    }
+    const participantIds = bet.participants.map((participant) => participant.userId);
+    const ballot = parseBallot(participantIds, body.data.outcomes);
+    if (!ballot) {
+      res.status(400).json({ error: "Vote success or fail for every participant" });
+      return;
+    }
+    let voterId = req.userId!;
+    let demo = false;
+    let castById: string | null = null;
+    if (body.data.asUserId && body.data.asUserId !== req.userId) {
+      const mine = bet.circle.members.find((member) => member.userId === req.userId);
+      if (!mine?.roles.includes("owner")) {
+        res.status(403).json({ error: "Only the circle owner can cast a demo vote for a practice partner" });
+        return;
+      }
+      const target = bet.circle.members.find((member) => member.userId === body.data.asUserId);
+      if (!target?.user.practice) {
+        res.status(403).json({ error: "Demo votes are only for practice partners" });
+        return;
+      }
+      voterId = target.userId;
+      demo = true;
+      castById = req.userId!;
+    }
+    const eligible = new Set(
+      eligibleVoterIds(
+        participantIds,
+        bet.judges.map((judge) => judge.userId),
+        bet.circle.members.map((member) => member.userId),
+      ),
+    );
+    if (!eligible.has(voterId)) {
+      res.status(403).json({ error: "That person is not eligible to vote" });
+      return;
+    }
+    try {
+      await prisma.disputeBallot.create({
+        data: {
+          betId: bet.id,
+          voterId,
+          outcomes: body.data.outcomes,
+          demo,
+          castById,
+        },
+      });
+    } catch (error) {
+      if (isUnique(error)) {
+        res.status(409).json({ error: "That vote is already in" });
+        return;
+      }
+      throw error;
+    }
+    await settleBet(bet.id);
+    const fresh = await loadVisibleBet(bet.id, req.userId!);
+    res.status(201).json({ bet: serializeBet(fresh!, req.userId) });
+  });
+
+  app.post("/v1/bets/:id/dispute/close", async (req, res) => {
+    if (!isReporter(req)) {
+      res.status(401).json({ error: "Reporter key required" });
+      return;
+    }
+    const bet = await prisma.bet.findUnique({ where: { id: req.params.id } });
+    if (!bet) {
+      res.status(404).json({ error: "Bet not found" });
+      return;
+    }
+    if (bet.status === "active") {
+      res.status(409).json({ error: "Resolve the bet before closing the dispute window" });
+      return;
+    }
+    if (bet.status === "final") {
+      res.status(409).json({ error: "The result is already final" });
+      return;
+    }
+    await settleBet(bet.id, { forceClose: true });
+    const fresh = await prisma.bet.findUnique({
+      where: { id: bet.id },
+      include: { participants: { orderBy: { joinedAt: "asc" } } },
+    });
+    res.json({
+      status: fresh?.status,
+      disputeResolution: fresh?.disputeResolution,
+      outcomes: (fresh?.participants ?? []).map((participant) => ({
+        userId: participant.userId,
+        outcome: participant.outcome,
+      })),
+    });
+  });
+
   app.post("/v1/bets/:id/resolve", async (req, res) => {
-    if (req.header("x-reporter-key") !== (process.env.REPORTER_API_KEY || "dev-reporter")) {
+    if (!isReporter(req)) {
       res.status(401).json({ error: "Reporter key required" });
       return;
     }
@@ -516,7 +843,7 @@ export function createApp() {
       res.status(404).json({ error: "Bet not found" });
       return;
     }
-    if (bet.status === "resolved") {
+    if (bet.status !== "active") {
       res.status(409).json({ error: "Already resolved" });
       return;
     }
@@ -532,12 +859,16 @@ export function createApp() {
       ...decisions.map((decision) =>
         prisma.betParticipant.update({
           where: { betId_userId: { betId: bet.id, userId: decision.userId } },
-          data: { outcome: decision.outcome },
+          data: { outcome: decision.outcome, reporterOutcome: decision.outcome },
         }),
       ),
       prisma.bet.update({
         where: { id: bet.id },
-        data: { status: "resolved", evidenceHash: digest },
+        data: {
+          status: "resolved",
+          evidenceHash: digest,
+          disputeDeadline: new Date(Date.now() + bet.disputeWindowSeconds * 1000),
+        },
       }),
     ]);
     res.json({
@@ -556,7 +887,7 @@ export function createApp() {
       return;
     }
     const bets = await prisma.bet.findMany({
-      where: { circleId: req.params.id, status: "resolved" },
+      where: { circleId: req.params.id, status: { in: ["resolved", "final"] } },
       include: { participants: { include: { user: true } } },
       orderBy: { periodEnd: "desc" },
     });
@@ -611,54 +942,23 @@ export function createApp() {
 async function loadVisibleBet(id: string, userId: string) {
   const bet = await prisma.bet.findUnique({
     where: { id },
-    include: {
-      circle: { include: { members: true } },
-      participants: { include: { user: true }, orderBy: { joinedAt: "asc" } },
-      judges: { include: { user: true } },
-      proofs: {
-        include: {
-          user: true,
-          comments: { include: { user: true }, orderBy: { createdAt: "asc" } },
-          reactions: true,
-        },
-        orderBy: { createdAt: "asc" },
-      },
-    },
+    include: betInclude,
   });
   if (!bet || !bet.circle.members.some((member) => member.userId === userId)) return null;
   return bet;
 }
 
-function serializeBet(bet: {
-  id: string;
-  title: string;
-  betType: string;
-  category: string;
-  status: string;
-  stakeAmount: number;
-  goalHash: string;
-  onChainAddress: string | null;
-  requiredCount: number;
-  proofsRequired: number;
-  periodStart: Date;
-  periodEnd: Date;
-  evidenceHash: string | null;
-  participants: { outcome: string; user: { id: string; walletPubkey: string; displayName: string | null; ageConfirmed: boolean; practice: boolean } }[];
-  judges?: { vote: string | null; user: { id: string; walletPubkey: string; displayName: string | null; ageConfirmed: boolean; practice: boolean } }[];
-  proofs?: {
-    id: string;
-    caption: string | null;
-    photoPath: string;
-    photoHash: string;
-    capturedAt: Date;
-    flagged: boolean;
-    flagReason: string | null;
-    reported: boolean;
-    user: { id: string; walletPubkey: string; displayName: string | null; ageConfirmed: boolean; practice: boolean };
-    comments: { id: string; body: string; createdAt: Date; user: { id: string; walletPubkey: string; displayName: string | null; ageConfirmed: boolean; practice: boolean } }[];
-    reactions: { kind: string; userId: string }[];
-  }[];
-}) {
+function serializeBet(bet: FullBet, viewerId?: string) {
+  const participantIds = bet.participants.map((participant) => participant.userId);
+  const voterIds = eligibleVoterIds(
+    participantIds,
+    bet.judges.map((judge) => judge.userId),
+    bet.circle.members.map((member) => member.userId),
+  );
+  const people = new Map<string, PublicSource>();
+  for (const member of bet.circle.members) people.set(member.userId, member.user);
+  for (const judge of bet.judges) people.set(judge.userId, judge.user);
+  const membership = viewerId ? bet.circle.members.find((member) => member.userId === viewerId) : undefined;
   return {
     id: bet.id,
     title: bet.title,
@@ -673,16 +973,38 @@ function serializeBet(bet: {
     periodStart: bet.periodStart,
     periodEnd: bet.periodEnd,
     evidenceHash: bet.evidenceHash,
+    disputeWindowSeconds: bet.disputeWindowSeconds,
     feePayer: "Each signer pays their own network fee. This app does not sponsor SOL.",
+    viewer: {
+      userId: viewerId ?? "",
+      roles: membership?.roles ?? [],
+    },
     participants: bet.participants.map((participant) => ({
       outcome: participant.outcome,
+      reporterOutcome: participant.reporterOutcome,
       user: publicUser(participant.user),
     })),
-    judges: (bet.judges ?? []).map((judge) => ({
+    judges: bet.judges.map((judge) => ({
       vote: judge.vote,
       user: publicUser(judge.user),
     })),
-    proofs: (bet.proofs ?? []).map(serializeProof),
+    dispute: {
+      windowSeconds: bet.disputeWindowSeconds,
+      deadline: bet.disputeDeadline,
+      resolution: bet.disputeResolution,
+      disputer: bet.disputer ? publicUser(bet.disputer) : null,
+      eligibleVoters: voterIds
+        .map((id) => people.get(id))
+        .filter((user): user is PublicSource => Boolean(user))
+        .map((user) => publicUser(user)),
+      ballots: bet.ballots.map((ballot) => ({
+        demo: ballot.demo,
+        voter: publicUser(ballot.voter),
+        castBy: ballot.castBy ? publicUser(ballot.castBy) : null,
+        outcomes: ballot.outcomes,
+      })),
+    },
+    proofs: bet.proofs.map(serializeProof),
   };
 }
 
